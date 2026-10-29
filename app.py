@@ -4,7 +4,8 @@ Confidence-gated temporal fusion: one-page demo and results.
 Repo layout (unzip app_bundle.zip from the notebook next to this file):
     app.py, requirements.txt, packages.txt
     models/   variantA_V3.pt, variantB_best.pt, baseline2_unet_400.pt, fog_classifier.json
-    results/  results_fog_fix_hybrid.json, results_day14_master.json, results_day15_ablations.json
+    results/  results_fog_fix_hybrid.json, results_day14_master.json, results_day15_ablations.json,
+              results_extended_test.json
     examples/<scene id>/ ref.png, warped_prev1.png, warped_prev2.png, mask1.png, mask2.png, clean.png, meta.json
 
 All preprocessing matches the notebook: RGB order, values / 255, clamp to [0, 1] before uint8.
@@ -21,6 +22,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 HERE = Path(__file__).parent
+DEMO_ORDER = ["004624", "003320", "006833", "001140", "003311"]       # shown first in the scene list
+NAMES = {"B1_raw": "Raw degraded frame (B1)", "B2_unet": "Single-frame U-Net (B2)",
+         "B3_equal_avg": "Equal-weight average (B3)", "VariantA": "Variant A: confidence-gated fusion",
+         "VariantB": "Variant B: detection-aware fine-tuning", "RestoreFuse_all": "Restore-then-fuse on every scene",
+         "Hybrid_route": "Hybrid (final system)", "Hybrid_RestoreFuse": "Hybrid with restore-then-fuse on fog",
+         "clean_upper": "Clean image (upper bound)"}
 MODELS, RESULTS, EXAMPLES = HERE / "models", HERE / "results", HERE / "examples"
 torch.set_grad_enabled(False)
 
@@ -210,12 +217,12 @@ def run_all(ref_b, w1_b, w2_b, m1_g, m2_g):
     if clf is not None:
         p_fog = fog_probability(clf, ref, w1, w2)
         if p_fog >= 0.5:
-            hybrid = C[:, 0:1] * restore(w2) + C[:, 1:2] * restore(w1) + C[:, 2:3] * restore(ref)
-            route = ("fog", p_fog, "restore each frame with the U-Net, then fuse with the learned weights")
+            hybrid = restore(ref)
+            route = ("fog", p_fog, "U-Net restoration, because blending foggy frames cannot remove haze")
         else:
             hybrid = fused_a
             route = ("motion blur", 1 - p_fog, "confidence-gated fusion (Variant A)")
-        out["Hybrid: degradation-aware"] = to_rgb_uint8(hybrid)
+        out["Hybrid (final system)"] = to_rgb_uint8(hybrid)
 
     lo = torch.minimum(torch.minimum(ref, w1), w2); hi = torch.maximum(torch.maximum(ref, w1), w2)
     sane = ((fused_a < lo - 1e-3) | (fused_a > hi + 1e-3)).float().mean().item() < 0.001
@@ -238,7 +245,9 @@ if missing:
 tab_try, tab_results, tab_how = st.tabs(["Try it", "Results", "How it works"])
 
 def try_tab():
-    examples = sorted(p for p in EXAMPLES.iterdir() if p.is_dir()) if EXAMPLES.exists() else []
+    examples = sorted((p for p in EXAMPLES.iterdir() if p.is_dir()),
+                      key=lambda p: (DEMO_ORDER.index(p.name) if p.name in DEMO_ORDER else len(DEMO_ORDER), p.name)
+                      ) if EXAMPLES.exists() else []
     modes = (["Test scene from our dataset"] if examples else []) + ["Upload your own aligned frames"]
     mode = st.radio("Input", modes, horizontal=True)
     clean_rgb, meta = None, None
@@ -306,40 +315,49 @@ with tab_try:
     try_tab()
 
 with tab_results:
-    st.write("Held-out test set: 80 KITTI scenes (39 fog, 41 motion blur), 304 cars and 33 pedestrians. "
-             "Detection is YOLOv8n; AP50 is average precision at IoU 0.5.")
     load = lambda n: json.load(open(RESULTS / n)) if (RESULTS / n).exists() else None
+    pretty = lambda df: df.rename(index=lambda m: NAMES.get(m, m))
+    ext, main = load("results_extended_test.json"), load("results_fog_fix_hybrid.json")
+    d14, d15 = load("results_day14_master.json"), load("results_day15_ablations.json")
 
-    main = load("results_fog_fix_hybrid.json")
+    if ext:
+        st.subheader("Headline result: 480 held-out test scenes")
+        st.write("Change in car detection (AP50) of the final hybrid system compared with the raw degraded frame, "
+                 "with 95% bootstrap confidence intervals.")
+        cols = st.columns(3)
+        for col, grp in zip(cols, ("all", "fog", "blur")):
+            v = ext.get("bootstrap", {}).get(f"all 480 | {grp} | Hybrid_route - B1_raw")
+            if v:
+                col.metric(f"{grp.capitalize()} scenes", f"{v[0]:+.3f} AP50", f"95% CI [{v[1]:+.3f}, {v[2]:+.3f}]",
+                           delta_color="off")
+        for name, cap in (("all 480", "All 480 test scenes (80 original + 400 extra)"),
+                          ("new 400", "The 400 extra scenes only")):
+            if name in ext.get("tables", {}):
+                st.markdown(f"**{cap}**")
+                st.dataframe(pretty(pd.DataFrame(ext["tables"][name]).T)
+                             .rename(columns={"car_ap50": "Car AP50", "psnr": "PSNR (dB)"})
+                             .style.format("{:.3f}", na_rep="-"), use_container_width=True)
+        st.caption("The 400 extra scenes were never used for training, validation or model selection.")
+
+    st.divider()
+    st.write("Original test set: 80 KITTI scenes (39 fog, 41 motion blur), 304 cars and 33 pedestrians. "
+             "Detection is YOLOv8n; AP50 is average precision at IoU 0.5.")
     if main:
-        st.subheader("All methods")
+        st.subheader("All methods by degradation type")
         rows = {m: {"Car AP50 (all)": v["car_ap50"]["all"], "Car AP50 (fog)": v["car_ap50"]["fog"],
                     "Car AP50 (blur)": v["car_ap50"]["blur"], "Car AP50:95": v.get("car_ap50_95"),
                     "Pedestrian AP50": v.get("ped_ap50"), "PSNR all (dB)": v["psnr"]["all"],
                     "PSNR fog": v["psnr"]["fog"], "PSNR blur": v["psnr"]["blur"]} for m, v in main.items()}
-        st.dataframe(pd.DataFrame(rows).T.style.format("{:.3f}", na_rep="-"), use_container_width=True)
-
-    d14 = load("results_day14_master.json")
+        st.dataframe(pretty(pd.DataFrame(rows).T).style.format("{:.3f}", na_rep="-"), use_container_width=True)
     if d14:
         st.subheader("Main comparison with image quality")
-        st.dataframe(pd.DataFrame(d14).T.rename(columns={"car_ap50": "Car AP50", "car_map": "Car AP50:95",
-                                                         "psnr": "PSNR (dB)", "ssim": "SSIM"})
+        st.dataframe(pretty(pd.DataFrame(d14).T)
+                     .rename(columns={"car_ap50": "Car AP50", "car_map": "Car AP50:95", "psnr": "PSNR (dB)", "ssim": "SSIM"})
                      .style.format("{:.3f}", na_rep="-"), use_container_width=True)
-
-    d15 = load("results_day15_ablations.json")
     if d15:
         st.subheader("Ablation study")
         st.dataframe(pd.DataFrame(d15).T, use_container_width=True)
         st.caption("Alignment was removed at test time only; the model was not retrained without it.")
-    ext = load("results_extended_test.json")
-    if ext:
-        for name in ("all 480", "new 400"):
-            if name in ext.get("tables", {}):
-                st.subheader(f"Extended held-out test set ({name} scenes)")
-                st.dataframe(pd.DataFrame(ext["tables"][name]).T
-                             .rename(columns={"car_ap50": "Car AP50", "psnr": "PSNR (dB)"})
-                             .style.format("{:.3f}", na_rep="-"), use_container_width=True)
-        st.caption("The 400 extra scenes were never used for training or model selection.")
     if not (main or d14 or d15 or ext):
         st.info("No result files found in results/.")
 
@@ -356,13 +374,14 @@ trust weight for each one at every pixel. The output is their weighted blend, wi
 
 **4. Variant B.** Variant A fine-tuned with extra weight on the regions where objects are.
 
-**5. Degradation-aware hybrid.** A small classifier recognises fog or blur. Fog goes through the U-Net
-first (restore each frame, then fuse), because blending foggy frames cannot remove haze. Blur goes
-through Variant A.
+**5. Degradation-aware hybrid (final system).** A small classifier recognises fog or blur from image
+statistics. Foggy scenes go to the U-Net restorer, because blending frames that share the same haze cannot
+remove it. Blurred scenes go to Variant A, where frames differ in sharpness and fusion helps. We also tested
+restoring each frame and then fusing them; it did worse on fog because alignment errors add artefacts.
 
 **6. Detection and evaluation.** YOLOv8n detects cars and pedestrians on every output. We compare against
 the raw frame, a single-frame U-Net and equal averaging, using AP, PSNR, SSIM and bootstrap confidence
-intervals.
+intervals, on 80 test scenes and on 400 further held-out scenes.
 
 Trained and tested on synthetic degradation; real fog and blur may behave differently.
 """)
