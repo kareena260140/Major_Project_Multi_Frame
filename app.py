@@ -351,12 +351,21 @@ with tab_results:
         st.dataframe(pretty(pd.DataFrame(rows).T).style.format("{:.3f}", na_rep="-"), use_container_width=True)
     if d14:
         st.subheader("Main comparison with image quality")
-        st.dataframe(pretty(pd.DataFrame(d14).T)
+        st.dataframe(pretty(pd.DataFrame(d14).T.apply(pd.to_numeric, errors="coerce"))
                      .rename(columns={"car_ap50": "Car AP50", "car_map": "Car AP50:95", "psnr": "PSNR (dB)", "ssim": "SSIM"})
                      .style.format("{:.3f}", na_rep="-"), use_container_width=True)
     if d15:
         st.subheader("Ablation study")
-        st.dataframe(pd.DataFrame(d15).T, use_container_width=True)
+        abl = pd.DataFrame(d15).T
+        if "description" in abl.columns:
+            abl = abl.set_index("description")
+        abl = abl.rename(columns={"alignment": "Alignment", "confidence": "Frame weights", "loss": "Training loss",
+                                  "car_ap50": "Car AP50", "car_map": "Car AP50:95", "psnr": "PSNR (dB)", "ssim": "SSIM"})
+        if "Training loss" in abl.columns:
+            abl["Training loss"] = abl["Training loss"].replace({"Recon + DetLoss": "Recon + object-region loss"})
+        num = [c for c in ("Car AP50", "Car AP50:95", "PSNR (dB)", "SSIM") if c in abl.columns]
+        abl[num] = abl[num].apply(pd.to_numeric, errors="coerce")
+        st.dataframe(abl.style.format({c: "{:.3f}" for c in num}), use_container_width=True)
         st.caption("Alignment was removed at test time only; the model was not retrained without it.")
     if not (main or d14 or d15 or ext):
         st.info("No result files found in results/.")
