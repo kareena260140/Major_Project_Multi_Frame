@@ -11,6 +11,7 @@ Repo layout (unzip app_bundle.zip from the notebook next to this file):
 All preprocessing matches the notebook: RGB order, values / 255, clamp to [0, 1] before uint8.
 """
 import json
+import time
 from pathlib import Path
 
 import cv2
@@ -230,6 +231,70 @@ def run_all(ref_b, w1_b, w2_b, m1_g, m2_g):
 
 
 # ---------------------------------------------------------------------------
+# Live alignment for uploaded frames (RAFT-small at half resolution, so it fits the free CPU server)
+# ---------------------------------------------------------------------------
+MAX_W, FLOW_SCALE = 1242, 0.5
+LEVELS = {"mild": 0.4, "moderate": 0.65, "severe": 0.9}          # same strengths as in training
+
+
+@st.cache_resource
+def load_raft():
+    from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
+    w = Raft_Small_Weights.DEFAULT
+    return raft_small(weights=w, progress=False).eval(), w.transforms()
+
+
+def flow_between(a_bgr, b_bgr):
+    raft, T = load_raft()
+    H, W = a_bgr.shape[:2]
+    h, w = max(8, int(H * FLOW_SCALE) // 8 * 8), max(8, int(W * FLOW_SCALE) // 8 * 8)
+    small = lambda x: torch.from_numpy(cv2.cvtColor(cv2.resize(x, (w, h), interpolation=cv2.INTER_AREA),
+                                                    cv2.COLOR_BGR2RGB)).permute(2, 0, 1)[None]
+    a, b = T(small(a_bgr), small(b_bgr))
+    flow = F.interpolate(raft(a, b)[-1], size=(H, W), mode="bilinear", align_corners=False)
+    return torch.cat([flow[:, :1] * (W / w), flow[:, 1:] * (H / h)], 1)
+
+
+def warp_tensor(src, flow):                   # same as the notebook
+    _, _, h, w = src.shape
+    yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
+    coords = torch.stack([xx, yy], 0).float().unsqueeze(0) + flow
+    inb = ((coords[:, 0] >= 0) & (coords[:, 0] <= w - 1) & (coords[:, 1] >= 0) & (coords[:, 1] <= h - 1)).unsqueeze(1).float()
+    grid = torch.stack([2.0 * coords[:, 0] / max(w - 1, 1) - 1.0, 2.0 * coords[:, 1] / max(h - 1, 1) - 1.0], -1)
+    return F.grid_sample(src, grid, mode="bilinear", padding_mode="border", align_corners=True), inb
+
+
+def consistency_mask(f_fwd, f_bwd, alpha=0.01, beta=0.5):
+    bw, inb = warp_tensor(f_bwd, f_fwd)
+    lhs = ((f_fwd + bw) ** 2).sum(1, keepdim=True)
+    rhs = alpha * ((f_fwd ** 2).sum(1, keepdim=True) + (bw ** 2).sum(1, keepdim=True)) + beta
+    return (lhs < rhs).float() * inb
+
+
+def align_frames(ref_bgr, nb_bgr):            # returns the neighbour warped onto ref (BGR) and a 0..255 mask
+    f_fwd, f_bwd = flow_between(ref_bgr, nb_bgr), flow_between(nb_bgr, ref_bgr)
+    nb = torch.from_numpy(cv2.cvtColor(nb_bgr, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float().unsqueeze(0)
+    warped, _ = warp_tensor(nb, f_fwd)
+    mask = consistency_mask(f_fwd, f_bwd)[0, 0].numpy()
+    w = cv2.cvtColor(warped[0].permute(1, 2, 0).clamp(0, 255).byte().numpy(), cv2.COLOR_RGB2BGR)
+    return w, (mask * 255).astype(np.uint8)
+
+
+def add_fog(image, severity):                  # same as the notebook
+    img = image.astype(np.float32) / 255.0
+    h, w = img.shape[:2]
+    depth = np.repeat(np.linspace(0.3, 1.0, h).reshape(h, 1, 1), w, axis=1)
+    t = np.exp(-severity * 2.0 * depth)
+    return np.clip((img * t + 0.9 * (1 - t)) * 255, 0, 255).astype(np.uint8)
+
+
+def add_motion_blur(image, severity):
+    k = max(5, int(5 + severity * 40)); k += (k % 2 == 0)
+    kernel = np.zeros((k, k)); kernel[k // 2, :] = 1.0 / k
+    return cv2.filter2D(image, -1, kernel)
+
+
+# ---------------------------------------------------------------------------
 # Page
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Confidence-gated temporal fusion", layout="wide")
@@ -248,9 +313,10 @@ def try_tab():
     examples = sorted((p for p in EXAMPLES.iterdir() if p.is_dir()),
                       key=lambda p: (DEMO_ORDER.index(p.name) if p.name in DEMO_ORDER else len(DEMO_ORDER), p.name)
                       ) if EXAMPLES.exists() else []
-    modes = (["Test scene from our dataset"] if examples else []) + ["Upload your own aligned frames"]
+    modes = (["Test scene from our dataset"] if examples else []) + ["Upload three consecutive frames",
+                                                                      "Upload pre-aligned frames (advanced)"]
     mode = st.radio("Input", modes, horizontal=True)
-    clean_rgb, meta = None, None
+    clean_rgb, meta, align_view = None, None, None
 
     if mode.startswith("Test scene"):
         def label(p):
@@ -264,7 +330,45 @@ def try_tab():
         meta = json.load(open(pick / "meta.json"))
         st.caption(f"True degradation: {meta['type']}. Severity of t-2, t-1, t: "
                    f"{meta['severity_t2']}, {meta['severity_t1']}, {meta['severity_t']}. "
-                   "This scene was never used for training.")
+                   f"Image size {ref_b.shape[1]} x {ref_b.shape[0]} px. This scene was never used for training.")
+    elif mode.startswith("Upload three"):
+        st.caption("Upload three consecutive frames from one forward-facing driving clip, oldest first. "
+                   "They are aligned here with optical flow, then passed to every model.")
+        c1, c2, c3 = st.columns(3)
+        ups = [c1.file_uploader("Frame t-2 (oldest)", type=["png", "jpg", "jpeg"]),
+               c2.file_uploader("Frame t-1", type=["png", "jpg", "jpeg"]),
+               c3.file_uploader("Frame t (current)", type=["png", "jpg", "jpeg"])]
+        d1, d2, d3, d4 = st.columns([2, 1, 1, 1])
+        degrade = d1.selectbox("Add synthetic degradation", ["None (frames are already degraded)", "Fog", "Motion blur"])
+        sevs = [d2.selectbox("Severity t-2", list(LEVELS), index=1), d3.selectbox("Severity t-1", list(LEVELS), index=0),
+                d4.selectbox("Severity t", list(LEVELS), index=2)]
+        if not all(ups):
+            st.info("Add all three frames to run the models.")
+            return
+        dec = lambda f: cv2.imdecode(np.frombuffer(f.getvalue(), np.uint8), cv2.IMREAD_COLOR)
+        frames = [dec(f) for f in ups]
+        if any(x is None for x in frames):
+            st.error("One of the files is not a readable image."); return
+        sizes_in = [f"{x.shape[1]} x {x.shape[0]}" for x in frames]
+        H, W = frames[2].shape[:2]
+        sc = min(1.0, MAX_W / W)
+        Wn, Hn = int(round(W * sc)), int(round(H * sc))
+        frames = [cv2.resize(x, (Wn, Hn), interpolation=cv2.INTER_AREA) for x in frames]
+        if not degrade.startswith("None"):
+            fn = add_fog if degrade == "Fog" else add_motion_blur
+            frames = [fn(x, LEVELS[s]) for x, s in zip(frames, sevs)]
+        p2, p1, ref_b = frames
+        t0 = time.time()
+        with st.spinner("Aligning the frames with optical flow (about 10 to 30 seconds on the free server)"):
+            w1_b, m1_g = align_frames(ref_b, p1)
+            w2_b, m2_g = align_frames(ref_b, p2)
+        st.caption(f"Uploaded sizes (t-2, t-1, t): {', '.join(sizes_in)} px. Processed at {Wn} x {Hn} px"
+                   + (" (scaled down to KITTI width)" if sc < 1 else "") + f". Alignment took {time.time() - t0:.1f} s. "
+                   "Live alignment uses the smaller RAFT model at half resolution to fit this free server; "
+                   "the experiments used the large model at full resolution.")
+        align_view = [(p2, "Input t-2"), (p1, "Input t-1"), (ref_b, "Input t (current)"),
+                      (w2_b, f"t-2 aligned to t, {m2_g.mean() / 255:.0%} of pixels reliable"),
+                      (w1_b, f"t-1 aligned to t, {m1_g.mean() / 255:.0%} of pixels reliable")]
     else:
         st.caption("Use the five files from one aligned3/<scene id> folder made by the notebook.")
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -309,6 +413,12 @@ def try_tab():
         col.image(cv2.cvtColor(cmap, cv2.COLOR_BGR2RGB), caption=f"{name}: mean weight {C[k].mean():.2f}",
                   use_container_width=True)
     st.caption("Brighter means more trusted. At every pixel the three weights add up to 1.")
+    if align_view:
+        with st.expander("Alignment details: your frames and the older frames warped onto t"):
+            for row in range(0, len(align_view), 3):
+                cols = st.columns(3)
+                for col, (img, cap) in zip(cols, align_view[row:row + 3]):
+                    col.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption=cap, use_container_width=True)
 
 
 with tab_try:
