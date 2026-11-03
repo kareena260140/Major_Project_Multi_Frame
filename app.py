@@ -431,14 +431,11 @@ with tab_results:
 
     if ext:
         st.subheader("Headline result: 480 held-out test scenes")
-        st.write("Change in car detection (AP50) of the final hybrid system compared with the raw degraded frame, "
-                 "with 95% bootstrap confidence intervals.")
         cols = st.columns(3)
         for col, grp in zip(cols, ("all", "fog", "blur")):
             v = ext.get("bootstrap", {}).get(f"all 480 | {grp} | Hybrid_route - B1_raw")
             if v:
-                col.metric(f"{grp.capitalize()} scenes", f"{v[0]:+.3f} AP50", f"95% CI [{v[1]:+.3f}, {v[2]:+.3f}]",
-                           delta_color="off")
+                col.metric(f"{grp.capitalize()} scenes", f"{v[0]:+.3f} AP50")
         if "all 480" in ext.get("tables", {}):
             st.markdown("**All 480 test scenes (80 original + 400 extra)**")
             table = {m: v for m, v in ext["tables"]["all 480"].items() if m != "Hybrid_RestoreFuse"}
