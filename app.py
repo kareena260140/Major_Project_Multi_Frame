@@ -403,9 +403,6 @@ def try_tab():
 
     if not sane:
         st.warning("The fused output falls outside the range of its inputs, so the input files or model files are wrong.")
-    if route:
-        st.success(f"Detected {route[0]} (probability {route[1]:.2f}). Hybrid path used: {route[2]}.")
-
     names = list(outputs)
     detections = {name: detect(outputs[name], yolo) for name in names}
     for row in range(0, len(names), 3):
