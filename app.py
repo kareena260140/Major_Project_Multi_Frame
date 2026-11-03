@@ -427,8 +427,7 @@ with tab_try:
 with tab_results:
     load = lambda n: json.load(open(RESULTS / n)) if (RESULTS / n).exists() else None
     pretty = lambda df: df.rename(index=lambda m: NAMES.get(m, m))
-    ext, main = load("results_extended_test.json"), load("results_fog_fix_hybrid.json")
-    d14, d15 = load("results_day14_master.json"), load("results_day15_ablations.json")
+    ext = load("results_extended_test.json")
 
     if ext:
         st.subheader("Headline result: 480 held-out test scenes")
@@ -440,44 +439,14 @@ with tab_results:
             if v:
                 col.metric(f"{grp.capitalize()} scenes", f"{v[0]:+.3f} AP50", f"95% CI [{v[1]:+.3f}, {v[2]:+.3f}]",
                            delta_color="off")
-        for name, cap in (("all 480", "All 480 test scenes (80 original + 400 extra)"),
-                          ("new 400", "The 400 extra scenes only")):
-            if name in ext.get("tables", {}):
-                st.markdown(f"**{cap}**")
-                st.dataframe(pretty(pd.DataFrame(ext["tables"][name]).T)
-                             .rename(columns={"car_ap50": "Car AP50", "psnr": "PSNR (dB)"})
-                             .style.format("{:.3f}", na_rep="-"), use_container_width=True)
-        st.caption("The 400 extra scenes were never used for training, validation or model selection.")
-
-    st.divider()
-    st.write("Original test set: 80 KITTI scenes (39 fog, 41 motion blur), 304 cars and 33 pedestrians. "
-             "Detection is YOLOv8n; AP50 is average precision at IoU 0.5.")
-    if main:
-        st.subheader("All methods by degradation type")
-        rows = {m: {"Car AP50 (all)": v["car_ap50"]["all"], "Car AP50 (fog)": v["car_ap50"]["fog"],
-                    "Car AP50 (blur)": v["car_ap50"]["blur"], "Car AP50:95": v.get("car_ap50_95"),
-                    "Pedestrian AP50": v.get("ped_ap50"), "PSNR all (dB)": v["psnr"]["all"],
-                    "PSNR fog": v["psnr"]["fog"], "PSNR blur": v["psnr"]["blur"]} for m, v in main.items()}
-        st.dataframe(pretty(pd.DataFrame(rows).T).style.format("{:.3f}", na_rep="-"), use_container_width=True)
-    if d14:
-        st.subheader("Main comparison with image quality")
-        st.dataframe(pretty(pd.DataFrame(d14).T.apply(pd.to_numeric, errors="coerce"))
-                     .rename(columns={"car_ap50": "Car AP50", "car_map": "Car AP50:95", "psnr": "PSNR (dB)", "ssim": "SSIM"})
-                     .style.format("{:.3f}", na_rep="-"), use_container_width=True)
-    if d15:
-        st.subheader("Ablation study")
-        abl = pd.DataFrame(d15).T
-        if "description" in abl.columns:
-            abl = abl.set_index("description")
-        abl = abl.rename(columns={"alignment": "Alignment", "confidence": "Frame weights", "loss": "Training loss",
-                                  "car_ap50": "Car AP50", "car_map": "Car AP50:95", "psnr": "PSNR (dB)", "ssim": "SSIM"})
-        if "Training loss" in abl.columns:
-            abl["Training loss"] = abl["Training loss"].replace({"Recon + DetLoss": "Recon + object-region loss"})
-        num = [c for c in ("Car AP50", "Car AP50:95", "PSNR (dB)", "SSIM") if c in abl.columns]
-        abl[num] = abl[num].apply(pd.to_numeric, errors="coerce")
-        st.dataframe(abl.style.format({c: "{:.3f}" for c in num}), use_container_width=True)
-        st.caption("Alignment was removed at test time only; the model was not retrained without it.")
-    if not (main or d14 or d15 or ext):
+        if "all 480" in ext.get("tables", {}):
+            st.markdown("**All 480 test scenes (80 original + 400 extra)**")
+            table = {m: v for m, v in ext["tables"]["all 480"].items() if m != "Hybrid_RestoreFuse"}
+            st.dataframe(pretty(pd.DataFrame(table).T)
+                         .rename(columns={"car_ap50": "Car AP50", "psnr": "PSNR (dB)"})
+                         .style.format("{:.3f}", na_rep="-"), use_container_width=True)
+        st.caption("These scenes were never used for training, validation or model selection.")
+    else:
         st.info("No result files found in results/.")
 
 with tab_how:
