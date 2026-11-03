@@ -431,6 +431,8 @@ with tab_results:
 
     if ext:
         st.subheader("Headline result: 480 held-out test scenes")
+        st.caption("This is a fixed summary over all 480 test scenes. It does not change based on the "
+                   "scene selected in the Try it tab.")
         cols = st.columns(3)
         for col, grp in zip(cols, ("all", "fog", "blur")):
             v = ext.get("bootstrap", {}).get(f"all 480 | {grp} | Hybrid_route - B1_raw")
