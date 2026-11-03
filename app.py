@@ -187,6 +187,16 @@ def with_boxes(rgb, yolo):
     return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
 
 
+def detect(rgb, yolo):
+    """Run YOLO once and return (boxed RGB image, cars found, pedestrians found) for this one image."""
+    res = yolo(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), verbose=False)[0]
+    names_map = res.names
+    classes = res.boxes.cls.tolist() if res.boxes is not None else []
+    cars = sum(1 for c in classes if names_map[int(c)] in ("car", "truck", "bus"))
+    peds = sum(1 for c in classes if names_map[int(c)] == "person")
+    return cv2.cvtColor(res.plot(), cv2.COLOR_BGR2RGB), cars, peds
+
+
 def run_all(ref_b, w1_b, w2_b, m1_g, m2_g):
     net_a, net_b, unet, clf = load_models()
     H, W = ref_b.shape[:2]
@@ -389,7 +399,7 @@ def try_tab():
     show_boxes = st.checkbox("Draw YOLOv8 detections", value=True)
     with st.spinner("Running all models"):
         outputs, C, route, sane = run_all(ref_b, w1_b, w2_b, m1_g, m2_g)
-        yolo = load_yolo() if show_boxes else None
+        yolo = load_yolo()
 
     if not sane:
         st.warning("The fused output falls outside the range of its inputs, so the input files or model files are wrong.")
@@ -397,14 +407,28 @@ def try_tab():
         st.success(f"Detected {route[0]} (probability {route[1]:.2f}). Hybrid path used: {route[2]}.")
 
     names = list(outputs)
+    detections = {name: detect(outputs[name], yolo) for name in names}
     for row in range(0, len(names), 3):
         cols = st.columns(3)
         for col, name in zip(cols, names[row:row + 3]):
+            boxed, _, _ = detections[name]
             cap = name if clean_rgb is None else f"{name}, PSNR {psnr(outputs[name], clean_rgb):.2f} dB"
-            col.image(with_boxes(outputs[name], yolo), caption=cap, use_container_width=True)
+            col.image(boxed if show_boxes else outputs[name], caption=cap, use_container_width=True)
     if clean_rgb is not None:
-        st.image(with_boxes(clean_rgb, yolo), caption="Clean original (ground truth, for reference only)",
-                 width=520)
+        st.image(with_boxes(clean_rgb, yolo) if show_boxes else clean_rgb,
+                 caption="Clean original (ground truth, for reference only)", width=520)
+
+    st.subheader("Table for this scene")
+    rows = []
+    for name in names:
+        _, cars, peds = detections[name]
+        row = {"Method": name, "Cars found": cars, "Pedestrians found": peds}
+        if clean_rgb is not None:
+            row["PSNR (dB)"] = round(float(psnr(outputs[name], clean_rgb)), 2)
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows).set_index("Method"), use_container_width=True)
+    st.caption("This table is computed live for the scene selected above. It is not the same as the "
+               "480-scene average shown in the Results tab.")
 
     st.subheader("How much Variant A trusted each frame")
     cols = st.columns(3)
